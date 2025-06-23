@@ -1,0 +1,392 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+import os
+from pathlib import Path
+import h5py
+
+# 设置中文字体（简化为只使用SimHei）
+plt.rcParams["font.family"] = ["SimHei"]
+plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+
+# 输出目录
+output_dir = r"D:\PCB仿真\CNC_Machining-main\M01_analysis"
+os.makedirs(output_dir, exist_ok=True)
+
+
+# 步骤1：读取原始H5数据（优化版）
+def load_raw_h5_data(machine="M01"):
+    """直接从原始H5文件加载数据，优化vibration_data的提取"""
+    root_dir = r"D:\PCB仿真\CNC_Machining-main\data"  # 使用您提供的路径
+    all_data = []
+
+    # 遍历工序（OP00-OP14）
+    for op in range(15):
+        op_id = f"OP{op:02d}"
+        op_path = os.path.join(root_dir, machine, op_id)
+
+        if not os.path.exists(op_path):
+            print(f"⚠️ 工序 {op_id} 不存在，跳过")
+            continue
+
+        # 遍历良品/不良品
+        for quality in ["good", "bad"]:
+            quality_path = os.path.join(op_path, quality)
+
+            if not os.path.exists(quality_path):
+                print(f"⚠️ 工序 {op_id} 的 {quality} 文件夹不存在，跳过")
+                continue
+
+            # 遍历H5文件
+            for file in os.listdir(quality_path):
+                if not file.endswith(".h5"):
+                    continue
+
+                file_path = os.path.join(quality_path, file)
+                try:
+                    with h5py.File(file_path, "r") as f:
+                        # 打印文件结构，帮助调试
+                        print(f"\n📁 文件结构: {file}")
+                        print(f"  根目录下对象: {list(f.keys())}")
+
+                        # 提取振动数据
+                        data = extract_vibration_data(f)
+
+                        if data is not None:
+                            # 创建DataFrame
+                            df = pd.DataFrame({
+                                '0': data.get('0', []),  # 振动X
+                                '1': data.get('1', []),  # 振动Y
+                                '2': data.get('2', []),  # 振动Z
+                                'machine': machine,
+                                'process': op_id,
+                                'is_defect': (quality == "bad"),
+                                'file_name': file
+                            })
+
+                            all_data.append(df)
+                            print(f"✅ 已加载 {file} ({op_id}/{quality})")
+                        else:
+                            print(f"❌ 无法从 {file} 提取振动数据")
+
+                except Exception as e:
+                    print(f"❌ 加载 {file} 失败: {str(e)[:50]}")
+
+    if all_data:
+        combined = pd.concat(all_data, ignore_index=True)
+        print(f"\n🎉 成功加载 {len(combined)} 行数据，来自 {len(all_data)} 个H5文件")
+        return combined
+    else:
+        print(f"❌ 未找到任何可用的 {machine} 数据")
+        return None
+
+
+# 辅助函数：从H5文件中提取振动数据（优化版）
+def extract_vibration_data(h5_file):
+    """优化vibration_data的提取逻辑"""
+    # 方法1：直接读取数据集（之前的方式）
+    try:
+        return {
+            '0': h5_file['0'][:],
+            '1': h5_file['1'][:],
+            '2': h5_file['2'][:]
+        }
+    except KeyError:
+        pass
+
+    # 方法2：假设 '0', '1', '2' 是组，尝试从组中读取数据
+    try:
+        return {
+            '0': h5_file['0']['data'][:],
+            '1': h5_file['1']['data'][:],
+            '2': h5_file['2']['data'][:]
+        }
+    except KeyError:
+        pass
+
+    # 方法3：尝试从vibration_data提取三轴振动
+    try:
+        vibration_data = h5_file['vibration_data'][:]
+
+        # 检查数据形状，确定如何分离三轴
+        if len(vibration_data.shape) == 1:
+            # 可能是一维数组，尝试均匀分割为三部分
+            length = len(vibration_data)
+            if length % 3 == 0:
+                segment = length // 3
+                return {
+                    '0': vibration_data[:segment],
+                    '1': vibration_data[segment:2 * segment],
+                    '2': vibration_data[2 * segment:]
+                }
+            else:
+                print(f"  ❌ 方法3失败：vibration_data形状为 {vibration_data.shape}，无法均匀分割")
+
+        elif len(vibration_data.shape) == 2:
+            # 二维数组，可能是 [样本数, 3] 或 [3, 样本数]
+            if vibration_data.shape[1] == 3:  # [样本数, 3]
+                return {
+                    '0': vibration_data[:, 0],  # X轴
+                    '1': vibration_data[:, 1],  # Y轴
+                    '2': vibration_data[:, 2]  # Z轴
+                }
+            elif vibration_data.shape[0] == 3:  # [3, 样本数]
+                return {
+                    '0': vibration_data[0, :],  # X轴
+                    '1': vibration_data[1, :],  # Y轴
+                    '2': vibration_data[2, :]  # Z轴
+                }
+            else:
+                print(f"  ❌ 方法3失败：vibration_data形状为 {vibration_data.shape}，不是预期的三轴数据")
+
+        else:
+            print(f"  ❌ 方法3失败：vibration_data维度 {len(vibration_data.shape)} 不支持")
+
+    except Exception as e:
+        print(f"  ❌ 方法3失败: {str(e)[:50]}")
+
+    # 方法4：返回第一个文件的结构信息（用于调试）
+    if not hasattr(extract_vibration_data, 'structure_printed'):
+        print("\n📋 H5文件详细结构信息:")
+        h5_file.visititems(print_h5_structure)
+        extract_vibration_data.structure_printed = True
+
+    return None
+
+
+# 辅助函数：打印H5文件结构
+def print_h5_structure(name, obj):
+    """递归打印H5文件的结构"""
+    if isinstance(obj, h5py.Dataset):
+        print(f"  📄 数据集: {name}, 形状: {obj.shape}, 类型: {obj.dtype}")
+    elif isinstance(obj, h5py.Group):
+        print(f"  📁 组: {name}")
+
+
+# 步骤2：分析特定工序（以OP05为例）
+def analyze_process(df, process_id="OP05", target_axis="2"):
+    """分析指定工序的振动数据和不良品关联"""
+    if df is None:
+        return
+
+    # 筛选工序数据
+    process_data = df[df['process'] == process_id].copy()
+    if process_data.empty:
+        print(f"❌ 工序 {process_id} 无数据")
+        return
+
+    print(f"\n===== 分析工序 {process_id} =====")
+    print(f"总样本数: {len(process_data)}")
+    print(f"良品数: {len(process_data[process_data['is_defect'] == False])}")
+    print(f"不良品数: {len(process_data[process_data['is_defect'] == True])}")
+
+    # 1. 箱线图对比良品/不良品的振动分布
+    plt.figure(figsize=(10, 6))
+    sns.boxplot(x='is_defect', y=target_axis, data=process_data)
+    plt.title(f"{process_id} 工序: 良品 vs 不良品的振动{target_axis}分布")
+    plt.xlabel("是否不良品")
+    plt.ylabel(f"振动{target_axis}值")
+    plt.xticks([0, 1], ['良品', '不良品'])
+    plt.savefig(os.path.join(output_dir, f"{process_id}_boxplot.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # 计算统计差异
+    good_values = process_data[process_data['is_defect'] == False][target_axis]
+    bad_values = process_data[process_data['is_defect'] == True][target_axis]
+
+    # 2. 过程能力分析（假设规格上限USL=0.5）
+    def calculate_cpk(values, usl=0.5, lsl=0):
+        """计算过程能力指数CPK"""
+        mean = np.mean(values)
+        std = np.std(values)
+
+        cpl = (mean - lsl) / (3 * std)
+        cpu = (usl - mean) / (3 * std)
+        cpk = min(cpl, cpu)
+
+        return {
+            '平均值': mean,
+            '标准差': std,
+            'CPL': cpl,
+            'CPU': cpu,
+            'CPK': cpk
+        }
+
+    cpk_results = calculate_cpk(process_data[target_axis])
+    print("\n过程能力分析结果:")
+    for key, value in cpk_results.items():
+        print(f"  {key}: {value:.4f}")
+
+    # 3. 不良品振动阈值分析
+    print("\n不良品振动阈值分析:")
+    bad_stats = bad_values.describe()
+    print(f"  不良品振动{target_axis}平均值: {bad_stats['mean']:.4f}")
+    print(f"  不良品振动{target_axis}中位数: {bad_stats['50%']:.4f}")
+    print(f"  不良品振动{target_axis}80%分位数: {np.percentile(bad_values, 80):.4f}")
+
+    # 4. 关联分析（振动与不良的相关性）
+    # 将布尔值转为数值
+    process_data['is_defect_num'] = process_data['is_defect'].astype(int)
+
+    # 计算振动轴与不良的相关系数
+    correlations = {}
+    for axis in ['0', '1', '2']:  # X, Y, Z轴
+        corr = process_data[axis].corr(process_data['is_defect_num'])
+        correlations[axis] = corr
+        print(f"  振动{axis}与不良的相关系数: {corr:.4f}")
+
+    # 绘制相关性热图
+    plt.figure(figsize=(8, 6))
+    corr_matrix = process_data[['0', '1', '2', 'is_defect_num']].corr()
+    sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', fmt='.2f')
+    plt.title(f"{process_id} 工序: 振动与不良的相关性")
+    plt.savefig(os.path.join(output_dir, f"{process_id}_correlation.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # 保存分析结果到CSV
+    process_stats = process_data.groupby('is_defect')[target_axis].describe()
+    process_stats.to_csv(os.path.join(output_dir, f"{process_id}_stats.csv"))
+
+    return {
+        'process_id': process_id,
+        'cpk': cpk_results['CPK'],
+        'bad_mean': bad_stats['mean'],
+        'bad_80pct': np.percentile(bad_values, 80),
+        'correlations': correlations
+    }
+
+
+# 步骤3：分析所有工序，找出不良率最高的工序
+def analyze_all_processes(df, target_axis="2"):
+    """分析所有工序的不良情况和振动特征"""
+    if df is None:
+        return
+
+    # 统计各工序的不良率
+    process_stats = df.groupby('process').agg(
+        total_count=('process', 'count'),
+        defect_count=('is_defect', 'sum'),
+        defect_rate=('is_defect', 'mean')
+    ).reset_index()
+
+    # 按不良率排序
+    process_stats = process_stats.sort_values('defect_rate', ascending=False)
+
+    # 绘制帕累托图
+    plt.figure(figsize=(12, 6))
+    ax1 = plt.subplot(111)
+    ax1.bar(process_stats['process'], process_stats['defect_count'], color='blue')
+    ax1.set_ylabel('不良品数量', color='blue')
+
+    ax2 = ax1.twinx()
+    ax2.plot(process_stats['process'], process_stats['defect_rate'].cumsum() / process_stats['defect_rate'].sum(),
+             color='red', marker='o')
+    ax2.set_ylabel('累积不良率', color='red')
+    ax2.set_ylim(0, 1.1)
+
+    plt.title('各工序不良品数量及累积不良率')
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "process_pareto.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # 分析各工序的振动特征
+    process_vibration = df.groupby('process').agg(
+        vibration_mean=(target_axis, 'mean'),
+        vibration_std=(target_axis, 'std')
+    ).reset_index()
+
+    # 合并不良率和振动特征
+    process_summary = pd.merge(process_stats, process_vibration, on='process')
+
+    # 保存工序分析结果
+    process_summary.to_csv(os.path.join(output_dir, "all_process_summary.csv"), index=False)
+
+    print("\n===== 各工序分析结果 =====")
+    print(process_summary)
+
+    return process_summary
+
+
+# 步骤4：找出振动异常的工序
+def identify_abnormal_processes(df, process_summary, target_axis="2", threshold=1.5):
+    """找出振动特征异常的工序"""
+    if df is None:
+        return
+
+    # 计算所有工序振动的平均值和标准差
+    overall_mean = df[target_axis].mean()
+    overall_std = df[target_axis].std()
+
+    # 找出振动均值异常的工序
+    abnormal_mean = process_summary[
+        (process_summary['vibration_mean'] > overall_mean + threshold * overall_std) |
+        (process_summary['vibration_mean'] < overall_mean - threshold * overall_std)
+        ]
+
+    # 找出振动离散度异常的工序
+    abnormal_std = process_summary[
+        process_summary['vibration_std'] > process_summary['vibration_std'].mean() + threshold * process_summary[
+            'vibration_std'].std()
+        ]
+
+    print("\n===== 振动均值异常的工序 =====")
+    print(abnormal_mean[['process', 'vibration_mean', 'defect_rate']])
+
+    print("\n===== 振动离散度异常的工序 =====")
+    print(abnormal_std[['process', 'vibration_std', 'defect_rate']])
+
+    # 保存异常工序
+    abnormal_mean.to_csv(os.path.join(output_dir, "abnormal_mean_processes.csv"), index=False)
+    abnormal_std.to_csv(os.path.join(output_dir, "abnormal_std_processes.csv"), index=False)
+
+    return {
+        'abnormal_mean': abnormal_mean,
+        'abnormal_std': abnormal_std
+    }
+
+
+# 主函数：执行完整分析流程
+def run_analysis(machine="M01", target_axis="2", focus_process=None):
+    """执行完整的分析流程"""
+    print(f"\n===== 开始分析 {machine} 设备数据 =====")
+
+    # 加载原始H5数据（优化版）
+    df = load_raw_h5_data(machine)
+    if df is None:
+        return
+
+    # 分析特定工序（如果指定）
+    if focus_process:
+        process_result = analyze_process(df, process_id=focus_process, target_axis=target_axis)
+        if process_result:
+            print(f"\n重点工序 {focus_process} 分析完成！")
+            print(f"  - CPK值: {process_result['cpk']:.4f}")
+            print(f"  - 不良品振动{target_axis}平均值: {process_result['bad_mean']:.4f}")
+            print(f"  - 振动{target_axis}与不良的相关系数: {process_result['correlations'][target_axis]:.4f}")
+
+    # 分析所有工序
+    process_summary = analyze_all_processes(df, target_axis=target_axis)
+
+    # 找出异常工序
+    abnormal_processes = identify_abnormal_processes(df, process_summary, target_axis=target_axis)
+
+    print(f"\n🎉 {machine} 设备数据分析完成！结果已保存到 {output_dir}")
+    print(
+        f"重点建议：优先优化不良率最高的工序（{process_summary.iloc[0]['process']}，不良率：{process_summary.iloc[0]['defect_rate']:.2%}）")
+
+    # 保存合并后的数据
+    df.to_csv(os.path.join(output_dir, f"{machine}_combined_data.csv"), index=False)
+
+    return {
+        'data': df,
+        'process_summary': process_summary,
+        'abnormal_processes': abnormal_processes
+    }
+
+
+# 执行分析（默认分析M01设备，重点关注OP05工序）
+if __name__ == "__main__":
+    results = run_analysis(machine="M01", target_axis="2", focus_process="OP05")
